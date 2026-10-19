@@ -70,9 +70,16 @@ for candidate in ["Malgun Gothic", "AppleGothic", "NanumGothic"]:
 plt.rcParams["axes.unicode_minus"] = False
 
 
-def sharpness_score(gray):
-    """Laplacian variance: 값이 낮을수록 흐릿함(초점/디테일 손실)"""
+def sharpness_raw(gray):
+    """원래 방식의 Laplacian 분산. 노이즈·줄무늬도 '디테일'로 세어져서 값이 부풀려진다
+    (2026-10-13 실제자료 14편 검증에서 노이즈가 심한 영상일수록 선명도가 높게 나옴을 확인)."""
     return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
+def sharpness_score(gray):
+    """노이즈 보정 선명도: 3x3 미디언 필터로 점 노이즈를 먼저 걷어낸 뒤 Laplacian 분산을 계산한다.
+    값이 낮을수록 흐릿함(초점/디테일 손실). 노이즈가 많다는 이유만으로 선명하게 나오는 문제를 줄인다."""
+    return cv2.Laplacian(cv2.medianBlur(gray, 3), cv2.CV_64F).var()
 
 
 def noise_score(gray):
@@ -99,6 +106,57 @@ def frame_diff_score(prev_gray, gray):
     return float(np.mean(diff))
 
 
+# ---- 콘텐츠 영역 탐지 (검은 띠 제외) ----
+# 4:3 영상이 16:9 프레임에 들어간 경우 등, 화면 양옆/위아래의 고정된 검은 띠는 세로줄·가로줄
+# 탐지기가 "여러 프레임에 걸쳐 같은 자리에 계속 있는 선"으로 오인한다(실제자료 14편 모두에서
+# 세로줄 비율이 60~100%로 나와 변별력이 없었음). 분석 전에 검은 띠를 찾아 잘라낸 뒤 지표를 계산한다.
+BORDER_DARK_THRESH = 24.0    # 이 밝기(0~255)보다 어두운 가장자리 열/행은 검은 띠로 본다
+BORDER_MARGIN = 4            # 콘텐츠 가장자리의 블러/경계 번짐을 피하려고 추가로 안쪽으로 줄이는 픽셀
+
+
+def detect_content_box(grays, dark_thresh=BORDER_DARK_THRESH, margin=BORDER_MARGIN):
+    """여러 프레임의 평균 이미지에서 가장자리의 어두운 띠를 찾아 (x0, x1, y0, y1) 반환.
+    띠가 없거나 판단이 불확실하면 프레임 전체를 반환한다."""
+    h, w = grays[0].shape
+    mean_img = np.stack(grays).astype(np.float32).mean(axis=0)
+    col_active = mean_img.mean(axis=0) > dark_thresh
+    row_active = mean_img.mean(axis=1) > dark_thresh
+    if not col_active.any() or not row_active.any():
+        return 0, w, 0, h
+    xs, ys = np.where(col_active)[0], np.where(row_active)[0]
+    x0, x1 = int(xs[0]), int(xs[-1]) + 1
+    y0, y1 = int(ys[0]), int(ys[-1]) + 1
+    # 실제로 띠가 있는 쪽만 안쪽으로 margin만큼 더 줄인다
+    if x0 > 0: x0 += margin
+    if x1 < w: x1 -= margin
+    if y0 > 0: y0 += margin
+    if y1 < h: y1 -= margin
+    if (x1 - x0) < 0.5 * w or (y1 - y0) < 0.5 * h:
+        return 0, w, 0, h
+    return x0, x1, y0, y1
+
+
+# ---- 화면 떨림(지터) ----
+# 실제자료 평가(2026-10-13)에서 "화면 떨림"이 눈에 띄는 영상이 있었으나 기존 지표 어느 것도 이를
+# 측정하지 못했다. 바로 이웃한 두 프레임 사이의 전체 화면 이동량(위상 상관)을 구하고, 그 이동량이
+# 주변(앞뒤 몇 개)의 부드러운 경로에서 얼마나 벗어나는지를 떨림(jitter, 픽셀)으로 본다.
+JITTER_WIDTH = 256           # 위상 상관 계산용 축소 폭
+JITTER_SMOOTH_WINDOW = 9     # 부드러운 경로를 만들 때 쓰는 중앙값 창(분석 프레임 개수)
+
+
+def _jitter_prep(gray):
+    h, w = gray.shape
+    scale = JITTER_WIDTH / float(w)
+    small = cv2.resize(gray, (JITTER_WIDTH, max(8, int(round(h * scale)))), interpolation=cv2.INTER_AREA)
+    return small.astype(np.float32), 1.0 / scale
+
+
+def _global_shift(ref_small, cur_small, scale):
+    """두 축소 프레임 사이의 전체 이동량(dx, dy) — 원본 해상도 픽셀 단위."""
+    (dx, dy), _ = cv2.phaseCorrelate(ref_small, cur_small)
+    return dx * scale, dy * scale
+
+
 # ---- 세로 스크래치 탐지 설정 ----
 # 1차 검증에서, 순수 랜덤 노이즈만 있는 영상에서도 통계적 임계값(평균+3표준편차)만으로는
 # 프레임마다 몇 개 컬럼이 우연히 '이상치'로 잡혀 오탐(false positive)이 심하게 나는 문제가
@@ -119,24 +177,39 @@ SCRATCH_STATIC_FRAME_DIFF_MIN = 1.0
 # 값보다 작으면 그 프레임은 스크래치 후보 계산에서 아예 제외한다.
 
 
+# ---- 선(線) 탐지 v2: '튀어나온 선'만 잡는다 (2026-10-13) ----
+# 기존 방식은 "컬럼 평균이 좌우 이웃 평균과 다른가"만 봐서, 스튜디오 세트의 문틀·기둥·배경 경계 같은
+# 콘텐츠의 세로 경계도 스크래치로 잡았다(실제자료 14편 모두 세로줄 비율 60~100%, 변별력 없음).
+# 진짜 스크래치/가로줄은 '이웃보다 밝거나 어두운 가느다란 선'이 화면 높이(너비) 대부분에 걸쳐
+# 같은 방향으로 나타나는 것이고, 콘텐츠의 계단형 경계(한쪽은 어둡고 한쪽은 밝음)는 좌우 이웃과의
+# 차이 부호가 서로 반대다. 그래서 "왼쪽·오른쪽 이웃보다 둘 다 밝거나 둘 다 어두운 픽셀"이 그 컬럼의
+# 대부분 행에서 나타날 때만 선 후보로 인정한다.
+LINE_NEIGHBOR_OFFSET = 4     # 비교할 이웃까지의 거리(px). 2~3px 굵기의 선도 잡히도록 조금 띄움
+LINE_MIN_CONTRAST = 6.0      # 이웃보다 이만큼(0~255) 이상 밝거나 어두워야 '선 픽셀'로 센다
+LINE_MIN_FRAC = 0.7          # 컬럼(행) 전체 길이 중 이 비율 이상이 '선 픽셀'이어야 선 후보
+
+
+def _bump_lines(gray, offset=LINE_NEIGHBOR_OFFSET, min_contrast=LINE_MIN_CONTRAST,
+                min_frac=LINE_MIN_FRAC):
+    """gray의 각 컬럼에 대해, 양쪽 이웃(±offset)보다 둘 다 min_contrast 이상 밝거나 둘 다 그만큼
+    어두운 픽셀이 세로 방향으로 min_frac 이상이면 그 컬럼 번호를 반환한다."""
+    g = gray.astype(np.float32)
+    h, w = g.shape
+    if w < 2 * offset + 8 or h < 8:
+        return np.array([], dtype=int)
+    center = g[:, offset:w - offset]
+    dl = center - g[:, :w - 2 * offset]
+    dr = center - g[:, 2 * offset:]
+    pos = (dl > min_contrast) & (dr > min_contrast)
+    neg = (dl < -min_contrast) & (dr < -min_contrast)
+    frac = np.maximum(pos.mean(axis=0), neg.mean(axis=0))
+    return np.where(frac >= min_frac)[0] + offset
+
+
 def scratch_columns(gray, abs_min=SCRATCH_ABS_MIN, z_thresh=SCRATCH_Z):
-    """한 프레임 안에서 좌우 이웃 컬럼들과 비교했을 때 유독 밝기가 다른(=세로줄 의심)
-    컬럼들의 x좌표 배열을 반환한다. 통계적 이상치(z_thresh) & 절대 편차(abs_min)를
-    모두 만족해야 후보로 잡는다."""
-    col_mean = gray.mean(axis=0).astype(np.float64)
-    if col_mean.shape[0] < 15:
-        return np.array([], dtype=int)
-    kernel = np.ones(11) / 11.0
-    # 가장자리 컬럼에서 numpy convolve가 암묵적으로 0을 채워 넣어 생기는
-    # 가짜 편차(false positive)를 막기 위해 reflect 패딩 후 'valid'로 계산
-    padded = np.pad(col_mean, (5, 5), mode="reflect")
-    local_avg = np.convolve(padded, kernel, mode="valid")
-    deviation = np.abs(col_mean - local_avg)
-    std = deviation.std()
-    if std < 1e-6:
-        return np.array([], dtype=int)
-    threshold = max(deviation.mean() + z_thresh * std, abs_min)
-    return np.where(deviation > threshold)[0]
+    """세로줄(스크래치) 후보 컬럼의 x좌표 배열. (abs_min, z_thresh는 이전 버전과의 호출 호환용으로
+    남겨 두었고 v2에서는 쓰지 않는다.)"""
+    return _bump_lines(gray)
 
 
 def scratch_score(gray):
@@ -152,21 +225,40 @@ def scratch_score(gray):
 # 컬럼(세로) 방향으로만 편차를 보기 때문에 가로 방향 손상은 애초에 측정 대상이 아니었던 것.
 # 같은 방식(로컬 평균 대비 편차 + 절대 하한 + 여러 프레임에 걸친 지속성 확인)을 행(row)
 # 방향에도 그대로 적용해서 가로줄을 잡는다.
+def _blocks(a, bh=12, bw=48):
+    h, w = a.shape
+    h2, w2 = h // bh * bh, w // bw * bw
+    return a[:h2, :w2].reshape(h2 // bh, bh, w2 // bw, bw).mean(axis=(1, 3))
+
+
+STREAK_FRAME_THRESH = 0.05   # 프레임의 5% 이상 블록이 줄무늬 훼손이면 '줄무늬 프레임'
+
+
+def streak_score(gray, prev_gray):
+    """굵은 가로 줄무늬/트래킹 노이즈(VHS형) 정도: 0~1 (줄무늬로 판단된 블록 비율).
+    블록마다 (세로 변화량 / 가로 변화량)이 크고(가로 결이 지배적), 직전 분석 프레임과 비교해
+    세로 변화 패턴이 바뀐 곳만 센다. 그래서 가만히 있는 가로선(글자줄, 문틀, 자막)은 제외된다.
+    또한 '인터레이스 빗살(combing)'은 제외한다: 빗살은 한 줄 건너(i, i+2) 값은 비슷하고 바로 옆 줄(i, i+1)만
+    다르지만, 트래킹 노이즈는 줄마다 제각각이라 i+2와도 크게 다르다.
+    실제 샘플 검증: bad_clip 10~16초 0.18~0.29, 나머지 구간·정상 영상 ≈0,
+    움직임이 빠른 인터레이스 영상(특수여성호신술)의 빗살은 0.16 → 0.03으로 감소."""
+    if prev_gray is None or prev_gray.shape != gray.shape:
+        return 0.0
+    g = gray.astype(np.float32); gp = prev_gray.astype(np.float32)
+    dy = np.abs(np.diff(g, axis=0))[:, :-1]
+    dx = np.abs(np.diff(g, axis=1))[:-1, :]
+    dy2 = np.abs(g[2:] - g[:-2])[:, :-1]
+    dyp = np.abs(np.diff(gp, axis=0))[:, :-1]
+    B, X, P, B2 = _blocks(dy), _blocks(dx), _blocks(dyp), _blocks(dy2)
+    nb = min(B.shape[0], B2.shape[0])
+    B, X, P, B2 = B[:nb], X[:nb], P[:nb], B2[:nb]
+    m = (B / (X + 1.0) > 1.8) & (B > 10) & (np.abs(B - P) > 6) & (B2 / (B + 1.0) > 0.7)
+    return float(m.mean())
+
+
 def line_rows(gray, abs_min=SCRATCH_ABS_MIN, z_thresh=SCRATCH_Z):
-    """한 프레임 안에서 위아래 이웃 행들과 비교했을 때 유독 밝기가 다른(=가로줄 의심)
-    행들의 y좌표 배열을 반환한다. scratch_columns()와 완전히 같은 방식을 행 방향에 적용."""
-    row_mean = gray.mean(axis=1).astype(np.float64)
-    if row_mean.shape[0] < 15:
-        return np.array([], dtype=int)
-    kernel = np.ones(11) / 11.0
-    padded = np.pad(row_mean, (5, 5), mode="reflect")
-    local_avg = np.convolve(padded, kernel, mode="valid")
-    deviation = np.abs(row_mean - local_avg)
-    std = deviation.std()
-    if std < 1e-6:
-        return np.array([], dtype=int)
-    threshold = max(deviation.mean() + z_thresh * std, abs_min)
-    return np.where(deviation > threshold)[0]
+    """가로줄(수평선) 후보 행의 y좌표 배열. scratch_columns와 같은 방식을 행 방향에 적용한다."""
+    return _bump_lines(gray.T)
 
 
 def line_score(gray):
@@ -338,32 +430,46 @@ def _damage_run_spans(df, sample_every):
 # values/grades에 추가되고, audio_missing은 오디오 트랙 자체가 없을 때만 추가된다. 즉
 # VERDICT_CRITERIA에 이름이 있어도 실제로 그 영상에서 계산되지 않았으면 판정에서 자동으로
 # 빠진다(summarize_condition의 verdict_grades는 grades에 실제로 있는 키만 본다).
-VERDICT_CRITERIA = ["mean_score", "p10_score", "damage_ratio", "max_run_span",
-                     "scratch_ratio", "hline_ratio",
-                     "audio_silence_ratio", "audio_max_silence_run",
-                     "audio_mean_dbfs", "audio_missing"]
+# 2026-10-14 개정: 실제자료 14편(사용자 평가 전부 4~5점)과 훼손 샘플로 확인한 결과
+#  - 평균/최저10% 상태점수와 세로줄(scratch) 비율은 정상 영상도 위험으로 만들고 훼손 영상과 구분이 안 되어
+#    판정에서 빼고 '참고 지표'로만 남겼다(화면에는 계속 표시).
+#  - 굵은 가로 줄무늬(streak_ratio)를 판정에 넣었다(bad_clip 24%, 정상 영상 0~4%).
+# 2026-10-14: 영상 판정(verdict)과 음성 판정(audio_verdict)을 따로 낸다.
+VIDEO_VERDICT_CRITERIA = ["damage_ratio", "max_run_span", "hline_ratio", "streak_ratio"]
+AUDIO_VERDICT_CRITERIA = ["audio_silence_ratio", "audio_max_silence_run",
+                          "audio_mean_dbfs", "audio_missing"]
+VERDICT_CRITERIA = VIDEO_VERDICT_CRITERIA + AUDIO_VERDICT_CRITERIA
 CRITERIA_THRESHOLDS = {
     "mean_score":    {"good": 65, "warn": 40, "higher_is_better": True},
     "p10_score":     {"good": 50, "warn": 30, "higher_is_better": True},
     "damage_ratio":  {"good": 3,  "warn": 10, "higher_is_better": False},
-    "max_run_span":  {"good": 5,  "warn": 15, "higher_is_better": False},
+    "max_run_span":  {"good": 1.0, "warn": 3.0, "higher_is_better": False},   # 초 (분석 간격과 무관하게 비교)
     "scratch_ratio": {"good": 2,  "warn": 10, "higher_is_better": False},
     "hline_ratio":   {"good": 2,  "warn": 10, "higher_is_better": False},
     "audio_silence_ratio":   {"good": 5,   "warn": 20,  "higher_is_better": False},
     "audio_max_silence_run": {"good": 3,   "warn": 10,  "higher_is_better": False},  # 초
     "audio_mean_dbfs":       {"good": -20, "warn": -35, "higher_is_better": True},   # dBFS(0에 가까울수록 큰 소리)
+    # 아래 두 개는 '참고 지표'(최종 판정 VERDICT_CRITERIA에는 아직 포함 안 함). 2026-10-13 실제자료
+    # 14편 평가에서 사용자가 지적한 '해상도 저하'와 '화면 떨림'을 측정하기 위해 추가했으며,
+    # 임계값은 임시값이다. 같은 14편을 다시 돌려 사용자 평가와 비교한 뒤 보정/판정 편입 여부를 정한다.
+    "streak_ratio": {"good": 5, "warn": 15, "higher_is_better": False},  # 굵은 가로 줄무늬 프레임 비율(%), 임시값
+    "jitter":           {"good": 0.5, "warn": 1.5, "higher_is_better": False},  # 화면 떨림(픽셀)
+    "resolution_short": {"good": 360, "warn": 240, "higher_is_better": True},   # 해상도 짧은 변(픽셀)
 }
 CRITERIA_LABELS = {
     "mean_score": "전체 평균 상태점수",
     "p10_score": "최저 10% 구간 평균 점수",
     "damage_ratio": "손상 후보 프레임 비율(%)",
-    "max_run_span": "최장 손상 구간 길이(프레임)",
+    "max_run_span": "최장 손상 구간 길이(초)",
     "scratch_ratio": "세로줄/스크래치 의심 비율(%)",
     "hline_ratio": "가로줄/수평선 의심 비율(%)",
     "audio_silence_ratio": "무음 구간 비율(%)",
     "audio_max_silence_run": "최장 무음 지속시간(초)",
     "audio_mean_dbfs": "평균 음량(dBFS)",
     "audio_missing": "음성 트랙 누락 여부",
+    "streak_ratio": "굵은 가로 줄무늬 프레임 비율(%)",
+    "jitter": "화면 떨림(픽셀, 참고)",
+    "resolution_short": "해상도 짧은 변(픽셀, 참고)",
 }
 
 
@@ -377,6 +483,15 @@ def _grade(value, cfg):
         if value <= good:
             return "양호"
         return "주의" if value <= warn else "위험"
+
+
+def _fps_of(df):
+    """분석 프레임의 frame_idx/time_sec 비율로 영상 fps를 추정(없으면 30)."""
+    try:
+        d = df[df["time_sec"] > 1.0]
+        return float((d["frame_idx"] / d["time_sec"]).median()) or 30.0
+    except Exception:
+        return 30.0
 
 
 def summarize_condition(df, sample_every=1, audio_summary=None):
@@ -401,10 +516,19 @@ def summarize_condition(df, sample_every=1, audio_summary=None):
         "mean_score": float(df["condition_score"].mean()),
         "p10_score": float(df["condition_score"].quantile(0.10)),
         "damage_ratio": (n_damage / total * 100.0) if total else 0.0,
-        "max_run_span": float(max(spans)) if spans else 0.0,
+        "max_run_span": (float(max(spans)) / _fps_of(df)) if spans else 0.0,
         "scratch_ratio": (n_scratch / total * 100.0) if total else 0.0,
         "hline_ratio": (n_hline / total * 100.0) if total else 0.0,
     }
+    # 참고 지표: 굵은 가로 줄무늬(트래킹 노이즈) 프레임 비율
+    if "streak" in df.columns:
+        values["streak_ratio"] = float((df["streak"] > STREAK_FRAME_THRESH).mean() * 100.0)
+    # 참고 지표(판정에는 미포함): 화면 떨림, 해상도
+    if "jitter" in df.columns and df["jitter"].notna().any():
+        values["jitter"] = float(df["jitter"].mean())
+    w, h = df.attrs.get("width"), df.attrs.get("height")
+    if w and h:
+        values["resolution_short"] = float(min(w, h))
     grades = {k: _grade(v, CRITERIA_THRESHOLDS[k]) for k, v in values.items()}
 
     if audio_summary == "no_audio":
@@ -419,16 +543,25 @@ def summarize_condition(df, sample_every=1, audio_summary=None):
     # audio_summary가 None이면(분석 안 함/불가) 오디오 관련 키를 아예 추가하지 않는다.
 
     order = {"양호": 0, "주의": 1, "위험": 2}
-    # 최종 판정(verdict)은 VERDICT_CRITERIA 중 이 영상에서 실제로 계산된 기준만 놓고 정한다.
-    verdict_grades = {k: g for k, g in grades.items() if k in VERDICT_CRITERIA}
-    verdict = max(verdict_grades.values(), key=lambda g: order[g])
-    reasons = [CRITERIA_LABELS[k] for k, g in verdict_grades.items() if g == verdict and verdict != "양호"]
+
+    def _worst(criteria):
+        gs = {k: g for k, g in grades.items() if k in criteria}
+        if not gs:
+            return "미분석", []
+        w = max(gs.values(), key=lambda g: order[g])
+        return w, ([CRITERIA_LABELS[k] for k, g in gs.items() if g == w] if w != "양호" else [])
+
+    # verdict = '영상 판정'(영상 지표만). 음성은 audio_verdict로 따로 낸다.
+    verdict, reasons = _worst(VIDEO_VERDICT_CRITERIA)
+    audio_verdict, audio_reasons = _worst(AUDIO_VERDICT_CRITERIA)
 
     return {
         "values": values,
         "grades": grades,
         "verdict": verdict,
         "reasons": reasons,
+        "audio_verdict": audio_verdict,
+        "audio_reasons": audio_reasons,
     }
 
 
@@ -476,10 +609,31 @@ def analyze_video(video_path, sample_every=1, outlier_z=2.5, max_damage_run=3,
 
     fps = cap.get(cv2.CAP_PROP_FPS) or 0.0
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    print(f"[정보] 총 {total_frames} 프레임, FPS {fps:.2f}, 분석 간격: {sample_every}프레임마다 1장")
+    vid_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    vid_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    print(f"[정보] 총 {total_frames} 프레임, FPS {fps:.2f}, 해상도 {vid_w}x{vid_h}, 분석 간격: {sample_every}프레임마다 1장")
+
+    # 앞부분 프레임 일부로 검은 띠(필러박스/레터박스)를 찾아 콘텐츠 영역만 분석한다
+    pre = []
+    for k in range(60):
+        ret, f0 = cap.read()
+        if not ret:
+            break
+        if k % 4 == 0:
+            pre.append(cv2.cvtColor(f0, cv2.COLOR_BGR2GRAY))
+    cap.release()
+    cap = cv2.VideoCapture(video_path)   # 처음부터 다시 읽기 위해 다시 연다(코덱에 따라 seek가 불안정할 수 있음)
+    if pre:
+        bx0, bx1, by0, by1 = detect_content_box(pre)
+    else:
+        bx0, bx1, by0, by1 = 0, vid_w, 0, vid_h
+    if (bx1 - bx0, by1 - by0) != (vid_w, vid_h) and pre:
+        print(f"[정보] 검은 띠 제외: 콘텐츠 영역 x {bx0}~{bx1}, y {by0}~{by1}")
 
     rows = []
     prev_gray = None
+    jitter_ref = None      # 직전 분석 프레임(축소본) — 바로 다음 프레임과 비교해 화면 이동량을 구함
+    jitter_scale = 1.0
     idx = 0
     scratch_history = deque(maxlen=SCRATCH_PERSIST_WINDOW)
     line_history = deque(maxlen=SCRATCH_PERSIST_WINDOW)
@@ -488,9 +642,16 @@ def analyze_video(video_path, sample_every=1, outlier_z=2.5, max_damage_run=3,
         ret, frame = cap.read()
         if not ret:
             break
+        frame = frame[by0:by1, bx0:bx1]
+        if jitter_ref is not None and rows:
+            g_next = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            sx, sy = _global_shift(jitter_ref, _jitter_prep(g_next)[0], jitter_scale)
+            rows[-1]["shift_x"], rows[-1]["shift_y"] = sx, sy
+            jitter_ref = None
         if idx % sample_every == 0:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             sharp = sharpness_score(gray)
+            sharp_raw = sharpness_raw(gray)
             noise = noise_score(gray)
             bright, contrast = brightness_contrast(gray)
             sat = saturation_score(frame)
@@ -533,6 +694,7 @@ def analyze_video(video_path, sample_every=1, outlier_z=2.5, max_damage_run=3,
                 "frame_idx": idx,
                 "time_sec": (idx / fps) if fps else None,
                 "sharpness": sharp,
+                "sharpness_raw": sharp_raw,
                 "noise": noise,
                 "brightness": bright,
                 "contrast": contrast,
@@ -542,14 +704,26 @@ def analyze_video(video_path, sample_every=1, outlier_z=2.5, max_damage_run=3,
                 "has_scratch": has_scratch_frame,
                 "hline_rows": len(line_rows_),
                 "has_hline": has_hline_frame,
+                "streak": streak_score(gray, prev_gray),
             })
             prev_gray = gray
+            jitter_ref, jitter_scale = _jitter_prep(gray)
         idx += 1
 
     cap.release()
     df = pd.DataFrame(rows)
     if df.empty:
         raise RuntimeError("분석할 프레임이 없습니다. 영상 경로/코덱을 확인하세요.")
+
+    # ---- 화면 떨림(jitter): 이동량이 주변의 부드러운 경로에서 벗어난 정도(픽셀) ----
+    for c in ("shift_x", "shift_y"):
+        if c not in df.columns:
+            df[c] = np.nan
+    sm_x = df["shift_x"].rolling(JITTER_SMOOTH_WINDOW, center=True, min_periods=3).median()
+    sm_y = df["shift_y"].rolling(JITTER_SMOOTH_WINDOW, center=True, min_periods=3).median()
+    df["jitter"] = np.sqrt((df["shift_x"] - sm_x) ** 2 + (df["shift_y"] - sm_y) ** 2)
+    df.attrs.update({"width": vid_w, "height": vid_h, "fps": fps,
+                     "content_box": (bx0, bx1, by0, by1)})
 
     # ---- 이상 프레임 탐지 (프레임 간 차이 기준 z-score) ----
     mean_fd, std_fd = df["frame_diff"].mean(), df["frame_diff"].std()

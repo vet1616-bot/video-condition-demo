@@ -14,10 +14,55 @@ condition_assessment.py의 분석 로직을 그대로 재사용해서,
 import os
 import tempfile
 
+import altair as alt
 import streamlit as st
 
 import condition_assessment as ca
 import db
+
+
+@st.cache_data(show_spinner=False, max_entries=2)
+def run_analysis(data, suffix, sample_every, zthresh, damage_run):
+    """영상 분석(영상+오디오). 같은 파일·설정이면 결과를 재사용해서, 그래프를 클릭해도 다시 분석하지 않는다."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+        tmp.write(data)
+        tmp_path = tmp.name
+    try:
+        df = ca.analyze_video(tmp_path, sample_every=sample_every,
+                              outlier_z=zthresh, max_damage_run=damage_run)
+        # 오디오(음성 누락/무음/음량)도 같이 분석 — tmp 파일을 지우기 전에 해야 함
+        audio_summary = ca.summarize_audio(ca.analyze_audio(tmp_path))
+    finally:
+        os.unlink(tmp_path)
+    return df, audio_summary
+
+
+def fmt_time(sec):
+    sec = int(round(sec))
+    return f"{sec // 60:02d}:{sec % 60:02d}"
+
+
+def worst_moments(df, n=8, min_gap_sec=3.0):
+    """점수가 가장 낮은 순간을 서로 min_gap_sec 이상 떨어지게 골라서 반환."""
+    picked = []
+    for _, r in df.sort_values("condition_score").iterrows():
+        if all(abs(r["time_sec"] - p["time_sec"]) >= min_gap_sec for p in picked):
+            picked.append(r)
+        if len(picked) >= n:
+            break
+    return sorted(picked, key=lambda r: r["time_sec"])
+
+
+def plot_line(series, ylabel=""):
+    """st.line_chart 대신 matplotlib으로 그린다(exe 배포 시 altair/jsonschema 의존을 피하기 위함)."""
+    fig, ax = ca.plt.subplots(figsize=(10, 3))
+    ax.plot(series.index, series.values, linewidth=1.2)
+    ax.set_xlabel("프레임 번호")
+    ax.set_ylabel(ylabel)
+    ax.grid(alpha=0.3)
+    fig.tight_layout()
+    st.pyplot(fig)
+    ca.plt.close(fig)
 
 st.set_page_config(page_title="영상 상태평가 데모", layout="wide")
 
@@ -52,31 +97,27 @@ uploaded = st.file_uploader(
 )
 
 if uploaded is not None:
-    # cv2.VideoCapture는 실제 파일 경로가 필요해서, 업로드된 내용을 임시 파일로 저장
+    video_slot = st.empty()   # 영상 자리: 아래 그래프를 클릭하면 이 자리의 영상이 해당 시점으로 이동
     suffix = os.path.splitext(uploaded.name)[1]
-    with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-        tmp.write(uploaded.read())
-        tmp_path = tmp.name
 
-    st.video(uploaded)
+    # 새 파일이면 이동 위치 초기화
+    file_key = (uploaded.name, uploaded.size)
+    if st.session_state.get("file_key") != file_key:
+        st.session_state["file_key"] = file_key
+        st.session_state["jump_sec"] = 0.0
+        st.session_state["jumped"] = False
+        st.session_state["last_pick"] = None
+
+    with video_slot.container():
+        st.video(uploaded, start_time=st.session_state["jump_sec"],
+                 autoplay=st.session_state["jumped"])
 
     with st.spinner("분석 중입니다... 영상 길이에 따라 시간이 걸릴 수 있어요."):
-        audio_summary = None
         try:
-            df = ca.analyze_video(
-                tmp_path,
-                sample_every=sample_every,
-                outlier_z=zthresh,
-                max_damage_run=damage_run,
-            )
-            # 오디오(음성 누락/무음/음량)도 같이 분석 — tmp 파일을 지우기 전에 해야 함
-            audio_result = ca.analyze_audio(tmp_path)
-            audio_summary = ca.summarize_audio(audio_result)
+            df, audio_summary = run_analysis(uploaded.getvalue(), suffix, sample_every, zthresh, damage_run)
         except Exception as e:
             st.error(f"분석 중 오류가 발생했습니다: {e}")
-            df = None
-        finally:
-            os.unlink(tmp_path)
+            df, audio_summary = None, None
 
     if df is not None:
         summary = ca.summarize_condition(df, sample_every=sample_every, audio_summary=audio_summary)
@@ -94,6 +135,81 @@ if uploaded is not None:
                 else:
                     st.warning(f"누적 기록 저장 실패: {msg}")
 
+        # ---- 그래프 클릭 → 영상 이동 ----
+        st.subheader("그래프를 클릭하면 영상이 그 시점으로 이동합니다")
+        if not df["time_sec"].notna().any():
+            st.info("이 영상은 초당 프레임 수(FPS)를 읽지 못해 시점 이동 기능을 쓸 수 없습니다.")
+        else:
+            plot_df = df[["frame_idx", "time_sec", "condition_score", "outlier_type",
+                          "has_scratch", "has_hline"]].copy()
+            plot_df["구분"] = plot_df["outlier_type"].replace("", "정상").fillna("정상")
+            plot_df["시각"] = plot_df["time_sec"].apply(fmt_time)
+            # 점이 너무 많으면 클릭 반응이 느려지므로 최대 3000개로 줄여서 그림 (손상 후보는 항상 포함)
+            if len(plot_df) > 3000:
+                keep = plot_df["구분"] == "손상 후보"
+                stride = max(1, len(plot_df) // 3000)
+                plot_df = plot_df[keep | (plot_df.index % stride == 0)]
+
+            pick = alt.selection_point(name="pick", fields=["frame_idx"], nearest=True,
+                                       on="click", clear=False)
+            color_scale = alt.Scale(domain=["정상", "손상 후보", "장면전환/동작 후보"],
+                                    range=["#2E75B6", "#C0504D", "#E2B93B"])
+            base = alt.Chart(plot_df).encode(
+                x=alt.X("time_sec:Q", title="시간(초)"),
+                y=alt.Y("condition_score:Q", title="상태점수", scale=alt.Scale(domain=[0, 100])),
+            )
+            line = base.mark_line(color="#9AA5B1")
+            dots = base.mark_circle().encode(
+                color=alt.Color("구분:N", scale=color_scale, legend=alt.Legend(title="구분")),
+                size=alt.condition(alt.datum["구분"] == "정상", alt.value(35), alt.value(110)),
+                opacity=alt.condition(pick, alt.value(1.0), alt.value(0.75)),
+                tooltip=[alt.Tooltip("시각:N", title="시각"),
+                         alt.Tooltip("frame_idx:Q", title="프레임"),
+                         alt.Tooltip("condition_score:Q", title="상태점수", format=".1f"),
+                         alt.Tooltip("구분:N", title="구분")],
+            ).add_params(pick)
+            event = st.altair_chart((line + dots).properties(height=280),
+                                    use_container_width=True, on_select="rerun",
+                                    selection_mode="pick", key="score_chart")
+
+            picked = None
+            try:
+                picked = event.selection.get("pick")
+            except Exception:
+                picked = None
+            if picked:
+                fidx = picked[0].get("frame_idx")
+                if fidx is not None and st.session_state.get("last_pick") != fidx:
+                    st.session_state["last_pick"] = fidx
+                    hit = df.loc[df["frame_idx"] == fidx]
+                    if not hit.empty:
+                        st.session_state["jump_sec"] = float(hit["time_sec"].iloc[0])
+                        st.session_state["jumped"] = True
+
+            # 점수가 가장 낮은 순간으로 바로 이동 (그래프 클릭이 어려울 때의 대안)
+            moments = worst_moments(df)
+            labels = [f"{fmt_time(r['time_sec'])}  (프레임 {int(r['frame_idx'])}, 점수 {r['condition_score']:.1f})"
+                      for r in moments]
+            choice = st.selectbox("점수가 가장 낮은 순간으로 바로 이동", ["선택하세요"] + labels,
+                                  key="worst_choice")
+            if choice != "선택하세요":
+                sec = float(moments[labels.index(choice)]["time_sec"])
+                if st.session_state.get("last_worst") != choice:
+                    st.session_state["last_worst"] = choice
+                    st.session_state["jump_sec"] = sec
+                    st.session_state["jumped"] = True
+            else:
+                st.session_state["last_worst"] = None
+
+            if st.session_state["jumped"]:
+                st.caption(f"현재 영상 위치: {fmt_time(st.session_state['jump_sec'])} "
+                           f"({st.session_state['jump_sec']:.1f}초)")
+
+            # 클릭 결과를 반영해서 위쪽 영상 다시 그리기
+            with video_slot.container():
+                st.video(uploaded, start_time=st.session_state["jump_sec"],
+                         autoplay=st.session_state["jumped"])
+
         st.subheader("종합 상태점수")
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("종합 상태점수 (0~100)", f"{v['mean_score']:.1f}")
@@ -102,18 +218,18 @@ if uploaded is not None:
         col4.metric("평균 대비", f"{df['contrast'].mean():.1f}")
 
         st.subheader("다기준 판정")
-        n_criteria = len(summary["grades"])
+        n_criteria = sum(1 for k in summary["grades"] if k in ca.VIDEO_VERDICT_CRITERIA)
         st.caption(
             "평균 점수 하나만 보면 짧고 심한 손상이 전체 평균에 묻히는 '평균 희석' 오류가 생길 수 있어, "
             "QCTools(구간별 임계값 flag)·TLVQM(저품질 구간 가중)·MediaSCORE(다기준 결합 판정) 방식을 참고해 "
-            f"아래 {n_criteria}개 기준 중 가장 나쁜 등급을 최종 판정으로 삼습니다. (세로줄/가로줄/음성은 "
-            "2026-09-30 실제 소장자료 재검증에서 실제 훼손과 일치함이 확인되어 판정 기준에 포함됨)"
+            f"영상 {n_criteria}개 기준 중 가장 나쁜 등급을 '영상 판정'으로 삼고, 음성(무음·음량·트랙 누락)은 "
+            "'음성 판정'으로 따로 표시합니다. 상태점수·세로줄 비율은 참고 지표입니다."
         )
         crit_info = [
             ("전체 평균 점수", v["mean_score"], summary["grades"]["mean_score"]),
             ("최저 10% 구간 평균", v["p10_score"], summary["grades"]["p10_score"]),
             ("손상 후보 비율(%)", v["damage_ratio"], summary["grades"]["damage_ratio"]),
-            ("최장 손상 구간(프레임)", v["max_run_span"], summary["grades"]["max_run_span"]),
+            ("최장 손상 구간(초)", v["max_run_span"], summary["grades"]["max_run_span"]),
             ("세로줄/스크래치 비율(%)", v["scratch_ratio"], summary["grades"]["scratch_ratio"]),
             ("가로줄/수평선 비율(%)", v["hline_ratio"], summary["grades"]["hline_ratio"]),
         ]
@@ -127,6 +243,12 @@ if uploaded is not None:
             if "audio_mean_dbfs" in v:
                 crit_info.append(("평균 음량(dBFS)", v["audio_mean_dbfs"], summary["grades"]["audio_mean_dbfs"]))
 
+        # 참고 지표(최종 판정에는 아직 미포함): 화면 떨림, 해상도
+        if "jitter" in v:
+            crit_info.append(("화면 떨림(px) · 참고", v["jitter"], summary["grades"]["jitter"]))
+        if "resolution_short" in v:
+            crit_info.append(("해상도 짧은 변(px) · 참고", v["resolution_short"], summary["grades"]["resolution_short"]))
+
         crit_cols = st.columns(3)
         for i, (label, value, grade) in enumerate(crit_info):
             display_val = value if isinstance(value, str) else f"{value:.1f}"
@@ -137,11 +259,21 @@ if uploaded is not None:
         verdict = summary["verdict"]
         reason_txt = f" (사유: {', '.join(summary['reasons'])})" if summary["reasons"] else ""
         if verdict == "위험":
-            st.error(f"상태 나쁨 — 훼손 가능성이 높습니다{reason_txt}. 우선 복원 검토를 권장합니다.")
+            st.error(f"영상 판정: 위험 — 훼손 가능성이 높습니다{reason_txt}. 우선 복원 검토를 권장합니다.")
         elif verdict == "주의":
-            st.warning(f"상태 주의 — 일부 기준에서 문제가 감지되었습니다{reason_txt}. 상세 확인을 권장합니다.")
+            st.warning(f"영상 판정: 주의 — 일부 기준에서 문제가 감지되었습니다{reason_txt}. 상세 확인을 권장합니다.")
         else:
-            st.success(f"상태 양호 — {n_criteria}개 기준 모두에서 뚜렷한 훼손 신호가 적습니다.")
+            st.success(f"영상 판정: 양호 — {n_criteria}개 기준 모두에서 뚜렷한 훼손 신호가 적습니다.")
+        a_verdict = summary.get("audio_verdict", "미분석")
+        a_reason = f" (사유: {', '.join(summary['audio_reasons'])})" if summary.get("audio_reasons") else ""
+        if a_verdict == "위험":
+            st.error(f"음성 판정: 위험{a_reason}")
+        elif a_verdict == "주의":
+            st.warning(f"음성 판정: 주의{a_reason}")
+        elif a_verdict == "양호":
+            st.success("음성 판정: 양호")
+        else:
+            st.info("음성 판정: 분석 안 됨")
 
         n_damage = int((df["outlier_type"] == "손상 후보").sum())
         n_scene = int((df["outlier_type"] == "장면전환/동작 후보").sum())
@@ -165,19 +297,19 @@ if uploaded is not None:
             ["종합 상태점수", "선명도", "노이즈", "스크래치(세로줄)", "가로줄(수평선)"]
         )
         with chart_tab1:
-            st.line_chart(df.set_index("frame_idx")["condition_score"])
+            plot_line(df.set_index("frame_idx")["condition_score"], "상태점수")
         with chart_tab2:
-            st.line_chart(df.set_index("frame_idx")["sharpness"])
+            plot_line(df.set_index("frame_idx")["sharpness"], "선명도")
         with chart_tab3:
-            st.line_chart(df.set_index("frame_idx")["noise"])
+            plot_line(df.set_index("frame_idx")["noise"], "노이즈")
         with chart_tab4:
-            st.line_chart(df.set_index("frame_idx")["scratch_cols"])
+            plot_line(df.set_index("frame_idx")["scratch_cols"], "의심 세로줄 개수")
             st.caption(
                 "프레임당 의심 세로줄 컬럼 개수 (최근 여러 프레임에 걸쳐 같은 자리에서 "
                 f"{ca.SCRATCH_PERSIST_MIN_HITS}번 이상 반복돼야 '스크래치 있음'으로 확정)"
             )
         with chart_tab5:
-            st.line_chart(df.set_index("frame_idx")["hline_rows"])
+            plot_line(df.set_index("frame_idx")["hline_rows"], "의심 가로줄 개수")
             st.caption(
                 "프레임당 의심 가로줄 행 개수 (세로줄과 같은 방식으로 최근 여러 프레임에 걸쳐 "
                 f"같은 자리에서 {ca.SCRATCH_PERSIST_MIN_HITS}번 이상 반복돼야 '가로줄 있음'으로 확정)"
